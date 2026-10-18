@@ -6,14 +6,22 @@ export interface SdsDocument {
 }
 
 export interface Source {
+  source_id: string
   document: string
   section: number
   title: string
+  page_start: number
+  page_end: number
+  text: string
+  similarity?: number | null
+  lexical_score?: number
+  fused_score?: number
 }
 
 export interface ChatResponse {
   answer: string
   sources: Source[]
+  retrieval?: { mode: string; candidates: number; reranking: string }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -39,11 +47,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string; chunks_stored: number }>('/'),
   documents: () => request<{ documents: SdsDocument[]; total_sections: number }>('/documents'),
-  chat: (question: string) => {
+  chat: (question: string, documents?: string[], mode = 'hybrid', deep = false) => {
     return request<ChatResponse>('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, documents, mode, deep }),
     })
   },
   upload: (file: File) => {
