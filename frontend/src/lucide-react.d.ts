@@ -11,9 +11,12 @@ declare module 'lucide-react' {
   export const ArrowUp: ComponentType<IconProps>
   export const Check: ComponentType<IconProps>
   export const ChevronDown: ComponentType<IconProps>
+  export const CircleQuestionMark: ComponentType<IconProps>
+  export const Copy: ComponentType<IconProps>
   export const FileText: ComponentType<IconProps>
   export const FlaskConical: ComponentType<IconProps>
   export const FolderOpen: ComponentType<IconProps>
+  export const Layers2: ComponentType<IconProps>
   export const LoaderCircle: ComponentType<IconProps>
   export const Menu: ComponentType<IconProps>
   export const MessageSquareText: ComponentType<IconProps>
@@ -23,4 +26,5 @@ declare module 'lucide-react' {
   export const ShieldCheck: ComponentType<IconProps>
   export const Sparkles: ComponentType<IconProps>
   export const X: ComponentType<IconProps>
+  export const Zap: ComponentType<IconProps>
 }

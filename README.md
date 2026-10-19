@@ -25,9 +25,8 @@ The existing `sds/` PDFs and `chroma_db/` database remain at the project root. T
 2. Install backend requirements and start FastAPI from the project root:
 
    ```powershell
-   .\venv\Scripts\Activate.ps1
-   pip install -r backend\requirements.txt
-   uvicorn main:app --app-dir backend --reload
+   .\venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+   .\venv\Scripts\python.exe -m uvicorn main:app --app-dir backend --reload
    ```
 
    The API is at `http://127.0.0.1:8000`; its interactive docs are at `/docs`.
@@ -63,4 +62,20 @@ From the project root, for example:
 python backend\embed_and_store.py sds\
 ```
 
-Already indexed section IDs are skipped. The frontend library lists documents represented in the Chroma collection; the PDF files in `sds/` are not automatically indexed on startup.
+The frontend library lists documents represented in Chroma; PDFs in `sds/` are not automatically indexed on startup.
+
+## Rebuild the passage index
+
+The current RAG pipeline uses the `sds_passages_v2` collection with smaller overlapping passages and page metadata. The previous `sds_sections` collection is left untouched. After upgrading from the original version, rebuild the passage index once:
+
+```powershell
+python backend\embed_and_store.py sds\
+```
+
+The same command can be run in Docker after starting Compose:
+
+```powershell
+docker compose exec backend python backend/embed_and_store.py /app/sds
+```
+
+Reindexing updates passages for PDFs with the same filename and removes stale passages after successful embedding. Scanned PDFs need OCR before upload; the parser reports when no selectable text is available.
