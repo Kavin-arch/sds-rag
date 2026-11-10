@@ -56,11 +56,13 @@ The existing `sds/` PDFs and `chroma_db/` database remain at the project root. T
    docker compose up --build
    ```
 
-3. Open `http://localhost:8080`. The API is also available at `http://localhost:8000`.
+3. Open `http://localhost:8080`. Both the web app and API are bound to localhost by default.
 
 Compose mounts `sds/` and `chroma_db/` from the project into the backend container, so uploaded PDFs and the local index persist on your computer. Keep `.env` private; it is excluded from Git.
 The backend container connects to an Ollama service on the host through `host.docker.internal`; set `OLLAMA_BASE_URL` in `.env` if needed.
 OpenRouter is called directly by the backend container; hosted model keys remain server-side and are never sent to the browser.
+
+The source library supports reindexing and removing documents. For PDFs uploaded through the app, citations can open the original PDF at the cited page. The welcome screen includes a comparison action that requires at least two selected SDS documents.
 
 ## Index PDFs from the CLI
 
@@ -87,3 +89,12 @@ docker compose exec backend python backend/embed_and_store.py /app/sds
 ```
 
 Reindexing updates passages for PDFs with the same filename and removes stale passages after successful embedding. Scanned PDFs need OCR before upload; the parser reports when no selectable text is available.
+
+## Run backend checks
+
+Install the development requirements and run the focused parser and citation checks:
+
+```powershell
+python -m pip install -r backend\requirements-dev.txt
+python -m pytest backend\tests
+```

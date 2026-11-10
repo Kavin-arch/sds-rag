@@ -2,10 +2,10 @@
 
 import hashlib
 import json
-import math
 import os
 import re
-import shutil
+import sqlite3
+from contextlib import closing
 import tempfile
 import urllib.error
 import urllib.request
@@ -15,11 +15,13 @@ from typing import Any, Literal
 import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
 from chunk_sds import chunk_sds
+from citation_guard import citations_reference_sources
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -56,6 +58,7 @@ collection = db_client.get_or_create_collection(
 )
 UPLOAD_DIR = PROJECT_ROOT / "sds"
 UPLOAD_DIR.mkdir(exist_ok=True)
+LEXICAL_DB_PATH = PROJECT_ROOT / "chroma_db" / "lexical_search.sqlite3"
 app = FastAPI(title="SDS Intelligence", version="2.0.0")
 
 
@@ -184,6 +187,8 @@ def store_chunks(chunks: list[dict[str, Any]]) -> int:
     stale_ids = [item_id for item_id in current["ids"] if item_id not in set(ids)]
     if stale_ids:
         collection.delete(ids=stale_ids)
+        _delete_lexical_rows(stale_ids)
+    _replace_lexical_rows(ids, [chunks[0]["document"]] * len(ids), documents)
     return len(chunks)
 
 
@@ -199,28 +204,71 @@ def _tokens(text: str) -> list[str]:
     return [token.lower() for token in TOKEN_PATTERN.findall(text) if token.lower() not in STOP_WORDS]
 
 
-def _lexical_scores(question: str, ids: list[str], documents: list[str]) -> dict[str, float]:
-    """Small-corpus BM25 ranking; complements embeddings for SDS identifiers/terms."""
-    query = set(_tokens(question))
-    if not query or not documents:
-        return {}
-    tokenized = [_tokens(document) for document in documents]
-    average_length = sum(map(len, tokenized)) / max(len(tokenized), 1)
-    document_frequency = {
-        term: sum(1 for terms in tokenized if term in set(terms)) for term in query
-    }
-    scores: dict[str, float] = {}
-    for item_id, terms in zip(ids, tokenized):
-        length = len(terms) or 1
-        score = 0.0
-        for term in query:
-            frequency = terms.count(term)
-            if frequency == 0:
-                continue
-            idf = math.log(1 + (len(tokenized) - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
-            score += idf * frequency * 2.2 / (frequency + 1.2 * (0.25 + 0.75 * length / max(average_length, 1)))
-        scores[item_id] = score
-    return scores
+def _lexical_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(LEXICAL_DB_PATH, timeout=30)
+    connection.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts "
+        "USING fts5(chunk_id UNINDEXED, document UNINDEXED, body, tokenize='unicode61 remove_diacritics 2')"
+    )
+    return connection
+
+
+def _replace_lexical_rows(ids: list[str], names: list[str], texts: list[str]) -> None:
+    if not ids:
+        return
+    with closing(_lexical_connection()) as connection:
+        with connection:
+            connection.executemany("DELETE FROM passages_fts WHERE chunk_id = ?", [(item_id,) for item_id in ids])
+            connection.executemany(
+                "INSERT INTO passages_fts(chunk_id, document, body) VALUES (?, ?, ?)",
+                list(zip(ids, names, texts)),
+            )
+
+
+def _delete_lexical_rows(ids: list[str]) -> None:
+    if not ids:
+        return
+    with closing(_lexical_connection()) as connection:
+        with connection:
+            connection.executemany("DELETE FROM passages_fts WHERE chunk_id = ?", [(item_id,) for item_id in ids])
+
+
+def _search_lexical(question: str, documents: list[str] | None = None) -> list[tuple[str, float]]:
+    terms = list(dict.fromkeys(_tokens(question)))
+    if not terms or documents == []:
+        return []
+    expression = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+    sql = "SELECT chunk_id, bm25(passages_fts) FROM passages_fts WHERE passages_fts MATCH ?"
+    params: list[Any] = [expression]
+    if documents is not None:
+        sql += f" AND document IN ({','.join('?' for _ in documents)})"
+        params.extend(documents)
+    sql += " ORDER BY bm25(passages_fts) LIMIT 200"
+    with closing(_lexical_connection()) as connection:
+        rows = connection.execute(sql, params).fetchall()
+    return [(str(item_id), float(score)) for item_id, score in rows]
+
+
+def _ensure_lexical_index() -> None:
+    """Build or repair the sidecar FTS index once at startup after a migration."""
+    with closing(_lexical_connection()) as connection:
+        indexed_count = connection.execute("SELECT count(*) FROM passages_fts").fetchone()[0]
+    if indexed_count == collection.count():
+        return
+    existing = collection.get(include=["documents", "metadatas"])
+    with closing(_lexical_connection()) as connection:
+        with connection:
+            connection.execute("DELETE FROM passages_fts")
+            connection.executemany(
+                "INSERT INTO passages_fts(chunk_id, document, body) VALUES (?, ?, ?)",
+                [
+                    (item_id, metadata.get("document", ""), text)
+                    for item_id, metadata, text in zip(existing["ids"], existing["metadatas"] or [], existing["documents"] or [])
+                ],
+            )
+
+
+_ensure_lexical_index()
 
 
 def retrieve(question: str, documents: list[str] | None = None, mode: str = "hybrid", deep: bool = False) -> list[dict[str, Any]]:
@@ -244,10 +292,14 @@ def retrieve(question: str, documents: list[str] | None = None, mode: str = "hyb
             semantic["ids"][0], semantic["documents"][0], semantic["metadatas"][0], semantic["distances"][0]
         ))
 
-    lexical_data = collection.get(where=where, include=["documents", "metadatas"])
-    lexical_scores = _lexical_scores(question, lexical_data["ids"], lexical_data["documents"] or [])
-    lexical_order = sorted(lexical_scores, key=lexical_scores.get, reverse=True)
-    lexical_rank = {item_id: rank for rank, item_id in enumerate(lexical_order, start=1) if lexical_scores[item_id] > 0}
+    lexical_matches = _search_lexical(question, documents) if mode in ("hybrid", "sparse") else []
+    lexical_rank = {item_id: rank for rank, (item_id, _) in enumerate(lexical_matches, start=1)}
+    lexical_scores = {item_id: abs(score) for item_id, score in lexical_matches}
+    lexical_data = collection.get(ids=list(lexical_rank), include=["documents", "metadatas"]) if lexical_rank else {"ids": [], "documents": [], "metadatas": []}
+    lexical_rows = {
+        item_id: (text, metadata)
+        for item_id, text, metadata in zip(lexical_data["ids"], lexical_data["documents"] or [], lexical_data["metadatas"] or [])
+    }
 
     records: dict[str, dict[str, Any]] = {}
     for rank, (item_id, text, metadata, distance) in enumerate(semantic_rows, start=1):
@@ -257,10 +309,10 @@ def retrieve(question: str, documents: list[str] | None = None, mode: str = "hyb
         }
     for item_id, rank in lexical_rank.items():
         if item_id not in records:
-            index = lexical_data["ids"].index(item_id)
+            text, metadata = lexical_rows[item_id]
             records[item_id] = {
-                "id": item_id, "text": lexical_data["documents"][index],
-                "metadata": lexical_data["metadatas"][index], "distance": None, "score": 0.0,
+                "id": item_id, "text": text,
+                "metadata": metadata, "distance": None, "score": 0.0,
             }
         if mode in ("hybrid", "sparse"):
             records[item_id]["score"] += 1.2 / (60 + rank)
@@ -379,6 +431,13 @@ Question: {question}"""
                 raise RuntimeError("GEMINI_API_KEY is required to use Gemini. Add it to the project root .env file.")
             response = gemini_client.models.generate_content(model=CHAT_MODEL, contents=prompt)
             answer = response.text or "The model returned no answer. Please rephrase your question and try again."
+        # Enforce that model citations point to source IDs actually sent in this request.
+        valid_source_ids = {source["source_id"] for source in sources}
+        if not citations_reference_sources(answer, valid_source_ids):
+            answer = (
+                "I couldn't produce an answer with verifiable citations. "
+                "Review the retrieved passages below or rephrase the question."
+            )
         return {"answer": answer, "sources": sources, "retrieval": {
             "mode": f"{mode.title()} search",
             "provider": (
@@ -410,6 +469,53 @@ def summary(document: str):
             for metadata, text in sections
         ],
     }
+
+
+def _uploaded_pdf_path(document: str) -> Path:
+    """Resolve a library filename to an uploaded PDF without allowing path traversal."""
+    if Path(document).name != document or not document.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="A PDF filename is required.")
+    path = (UPLOAD_DIR / document).resolve()
+    if path.parent != UPLOAD_DIR.resolve():
+        raise HTTPException(status_code=400, detail="Invalid PDF path.")
+    return path
+
+
+@app.get("/documents/{document}/file")
+def document_file(document: str):
+    path = _uploaded_pdf_path(document)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="The original PDF is not available in the local library.")
+    return FileResponse(path, media_type="application/pdf", filename=document, content_disposition_type="inline")
+
+
+@app.post("/documents/{document}/reindex")
+def reindex_document(document: str):
+    path = _uploaded_pdf_path(document)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="The original PDF is not available in the local library.")
+    try:
+        chunks = chunk_sds(str(path))
+        for chunk in chunks:
+            chunk["document"] = document
+        return {"filename": document, "passages_indexed": store_chunks(chunks)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reindex this SDS: {exc}") from exc
+
+
+@app.delete("/documents/{document}")
+def delete_document(document: str):
+    path = _uploaded_pdf_path(document)
+    results = collection.get(where={"document": document})
+    if not results["ids"]:
+        raise HTTPException(status_code=404, detail=f"No indexed data for '{document}'.")
+    collection.delete(ids=results["ids"])
+    _delete_lexical_rows(results["ids"])
+    if path.is_file():
+        path.unlink()
+    return {"filename": document, "deleted_passages": len(results["ids"])}
 
 
 @app.get("/")

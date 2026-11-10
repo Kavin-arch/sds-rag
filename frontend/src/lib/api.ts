@@ -63,4 +63,7 @@ export const api = {
       method: 'POST', body,
     })
   },
+  removeDocument: (filename: string) => request<{ filename: string; deleted_passages: number }>(`/documents/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
+  reindexDocument: (filename: string) => request<{ filename: string; passages_indexed: number }>(`/documents/${encodeURIComponent(filename)}/reindex`, { method: 'POST' }),
+  documentUrl: (filename: string) => `${API_BASE}/documents/${encodeURIComponent(filename)}/file`,
 }
