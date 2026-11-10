@@ -21,8 +21,10 @@ export interface Source {
 export interface ChatResponse {
   answer: string
   sources: Source[]
-  retrieval?: { mode: string; candidates: number; reranking: string }
+  retrieval?: { mode: string; provider?: string; candidates: number; reranking: string }
 }
+
+export type ChatProvider = 'gemini' | 'qwen' | 'qwen3_235b' | 'deepseek_r1'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
@@ -47,11 +49,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string; chunks_stored: number }>('/'),
   documents: () => request<{ documents: SdsDocument[]; total_sections: number }>('/documents'),
-  chat: (question: string, documents?: string[], mode = 'hybrid', deep = false) => {
+  chat: (question: string, documents?: string[], mode = 'hybrid', deep = false, provider: ChatProvider = 'gemini') => {
     return request<ChatResponse>('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, documents, mode, deep }),
+      body: JSON.stringify({ question, documents, mode, deep, provider }),
     })
   },
   upload: (file: File) => {

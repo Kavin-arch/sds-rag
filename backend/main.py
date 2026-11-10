@@ -1,13 +1,16 @@
 """FastAPI service for indexing and querying page-aware SDS passages."""
 
 import hashlib
+import json
 import math
 import os
 import re
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import chromadb
 from dotenv import load_dotenv
@@ -22,12 +25,25 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY is missing. Add it to the project root .env file.")
-
-gemini_client = genai.Client(api_key=api_key)
+gemini_client = genai.Client(api_key=api_key) if api_key else None
 EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.6-flash")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "300"))
+REMOTE_MODELS = {
+    "qwen3_235b": {
+        "label": "Qwen3 235B Instruct · OpenRouter",
+        "model": os.getenv("OPENROUTER_QWEN_MODEL", "qwen/qwen3-235b-a22b-2507"),
+    },
+    "deepseek_r1": {
+        "label": "DeepSeek R1 · OpenRouter",
+        "model": os.getenv("OPENROUTER_DEEPSEEK_MODEL", "deepseek/deepseek-r1"),
+    },
+}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_CONTEXT_CHARS = 9_000
 RETRIEVAL_LIMIT = 8
@@ -48,10 +64,13 @@ class ChatRequest(BaseModel):
     documents: list[str] | None = None
     mode: str = "hybrid"
     deep: bool = False
+    provider: Literal["gemini", "qwen", "qwen3_235b", "deepseek_r1"] = "gemini"
 
 
 def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
     """Embed a list in small batches, keeping output order aligned with input."""
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is required for semantic search and PDF indexing. Use Sparse search or add the key to the project root .env file.")
     vectors = []
     for start in range(0, len(texts), 50):
         result = gemini_client.models.embed_content(
@@ -65,6 +84,72 @@ def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
     if len(vectors) != len(texts):
         raise RuntimeError("The embedding model returned an unexpected number of vectors.")
     return vectors
+
+
+def generate_qwen(prompt: str) -> str:
+    """Generate an answer through the local Ollama chat API."""
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not reach Ollama at {OLLAMA_BASE_URL}. Make sure Ollama is running and the local model is available.") from exc
+
+    answer = result.get("message", {}).get("content", "").strip()
+    if not answer:
+        raise RuntimeError("Ollama returned an empty answer.")
+    return answer
+
+
+def generate_openrouter(prompt: str, model: str) -> str:
+    """Generate an answer through a hosted OpenAI-compatible OpenRouter endpoint."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Set OPENROUTER_API_KEY in the project root .env file to use hosted open-weight models.")
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "max_tokens": 2500,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OPENROUTER_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter returned HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not reach OpenRouter at {OPENROUTER_BASE_URL}.") from exc
+
+    choices = result.get("choices") or []
+    answer = choices[0].get("message", {}).get("content") if choices else None
+    if isinstance(answer, list):
+        answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
+    if not isinstance(answer, str) or not answer.strip():
+        raise RuntimeError("OpenRouter returned an empty answer.")
+    return answer.strip()
 
 
 def _chunk_id(chunk: dict[str, Any]) -> str:
@@ -285,10 +370,22 @@ Passages:
 {chr(10).join(contexts)}
 
 Question: {question}"""
-        response = gemini_client.models.generate_content(model=CHAT_MODEL, contents=prompt)
-        answer = response.text or "The model returned no answer. Please rephrase your question and try again."
+        if request.provider == "qwen":
+            answer = generate_qwen(prompt)
+        elif request.provider in REMOTE_MODELS:
+            answer = generate_openrouter(prompt, REMOTE_MODELS[request.provider]["model"])
+        else:
+            if gemini_client is None:
+                raise RuntimeError("GEMINI_API_KEY is required to use Gemini. Add it to the project root .env file.")
+            response = gemini_client.models.generate_content(model=CHAT_MODEL, contents=prompt)
+            answer = response.text or "The model returned no answer. Please rephrase your question and try again."
         return {"answer": answer, "sources": sources, "retrieval": {
             "mode": f"{mode.title()} search",
+            "provider": (
+                "Qwen 2.5 Coder" if request.provider == "qwen" else
+                REMOTE_MODELS[request.provider]["label"] if request.provider in REMOTE_MODELS else
+                "Gemini Flash"
+            ),
             "candidates": max((passage.get("candidate_count", 0) for passage in passages), default=0),
             "reranking": f"{'Reciprocal rank fusion (semantic + BM25 keyword)' if mode == 'hybrid' else 'Cosine similarity ranking' if mode == 'dense' else 'BM25 keyword ranking'}; {'deep retrieval, up to 16 passages' if request.deep else 'up to 8 passages'}; no model reranker",
         }}
