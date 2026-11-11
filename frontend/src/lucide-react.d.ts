@@ -13,6 +13,7 @@ declare module 'lucide-react' {
   export const ChevronDown: ComponentType<IconProps>
   export const CircleQuestionMark: ComponentType<IconProps>
   export const Copy: ComponentType<IconProps>
+  export const ExternalLink: ComponentType<IconProps>
   export const FileText: ComponentType<IconProps>
   export const FlaskConical: ComponentType<IconProps>
   export const FolderOpen: ComponentType<IconProps>
@@ -20,11 +21,15 @@ declare module 'lucide-react' {
   export const LoaderCircle: ComponentType<IconProps>
   export const Menu: ComponentType<IconProps>
   export const MessageSquareText: ComponentType<IconProps>
+  export const Moon: ComponentType<IconProps>
   export const Paperclip: ComponentType<IconProps>
   export const Plus: ComponentType<IconProps>
+  export const RefreshCw: ComponentType<IconProps>
   export const Search: ComponentType<IconProps>
   export const ShieldCheck: ComponentType<IconProps>
   export const Sparkles: ComponentType<IconProps>
+  export const Sun: ComponentType<IconProps>
+  export const Trash2: ComponentType<IconProps>
   export const X: ComponentType<IconProps>
   export const Zap: ComponentType<IconProps>
 }

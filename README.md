@@ -1,6 +1,6 @@
 # SDS Intelligence
 
-A local Safety Data Sheet workspace: upload SDS PDFs, browse your indexed library, and ask questions grounded in the document sections stored in Chroma.
+A local-first Safety Data Sheet workspace: upload SDS PDFs, browse your indexed library, and ask questions grounded in the document sections stored in Chroma. By default, embeddings and answer generation use Ollama on your computer.
 
 ## Project layout
 
@@ -9,18 +9,21 @@ backend/       FastAPI app, SDS parser, and indexing CLI
 frontend/      React + TypeScript + Vite application
 sds/           Source PDFs and uploaded PDFs
 chroma_db/     Existing local Chroma database
-.env           Local Gemini and optional hosted-provider keys (never commit this file)
+.env           Local model and optional provider settings (never commit this file)
 ```
 
 The existing `sds/` PDFs and `chroma_db/` database remain at the project root. The backend uses paths anchored to the project directory, so it can be started from the root or `backend/`.
 
 ## Run locally
 
-1. Add your Gemini key to the root `.env` file:
+1. Copy `.env.example` to `.env`. Install Ollama and pull the local answer and embedding models:
 
-   ```dotenv
-   GEMINI_API_KEY=your_key_here
+   ```powershell
+   ollama pull embeddinggemma
+   ollama pull qwen2.5-coder:7b
    ```
+
+   Local query expansion is off by default to avoid an extra model call for every question. Set `ENABLE_QUERY_EXPANSION=true` to try it. Ollama keeps a model loaded for up to 5 minutes by default (`OLLAMA_KEEP_ALIVE`), reducing reloads while limiting idle memory use. Gemini remains an optional embedding and answer provider; add `GEMINI_API_KEY` and set `EMBEDDING_PROVIDER=gemini` to use it for indexing and semantic retrieval.
 
 2. Install backend requirements and start FastAPI from the project root:
 
@@ -31,11 +34,11 @@ The existing `sds/` PDFs and `chroma_db/` database remain at the project root. T
 
    The API is at `http://127.0.0.1:8000`; its interactive docs are at `/docs`.
 
-3. To use the local Qwen 2.5 Coder option, run Ollama on the same computer and make sure its model tag matches `OLLAMA_MODEL` in `.env` (the default is `qwen2.5-coder:7b`; check installed tags with `ollama list`). Set `OLLAMA_BASE_URL` if Ollama listens on a different address.
+3. Ollama must stay running while you index and query documents. Set `OLLAMA_BASE_URL` if it listens on a different address. When using Docker, the backend connects to the host Ollama service through `host.docker.internal`.
 
 4. Optional hosted open-weight answer models are available through OpenRouter. Add an OpenRouter API key to `.env` as `OPENROUTER_API_KEY=...`; no model weights are downloaded or run on this computer. The model selector includes [Qwen3 235B A22B Instruct 2507](https://openrouter.ai/qwen/qwen3-235b-a22b-2507) and [DeepSeek R1](https://openrouter.ai/deepseek/deepseek-r1). You can override their model IDs with `OPENROUTER_QWEN_MODEL` and `OPENROUTER_DEEPSEEK_MODEL`, or change `OPENROUTER_BASE_URL` to another compatible endpoint that serves those IDs.
 
-   These are large, general open-weight instruction/reasoning models; they are not fine-tuned on your SDS files. The RAG pipeline supplies retrieved SDS passages as context. A stronger generator can improve answer quality, but does not guarantee correctness. Hosted usage may incur provider charges. Hosted requests send the question and retrieved SDS passages to OpenRouter and its selected inference provider; review their privacy and data-handling terms before using sensitive documents. Gemini embeddings still power indexing and Hybrid/Dense retrieval; Sparse retrieval can query an already indexed collection without a Gemini key.
+   These are large, general open-weight instruction/reasoning models; they are not fine-tuned on your SDS files. The RAG pipeline supplies retrieved SDS passages as context. A stronger generator can improve answer quality, but does not guarantee correctness. Hosted usage may incur provider charges. Hosted requests send the question and retrieved SDS passages to OpenRouter and its selected inference provider. Gemini and OpenRouter remain optional providers; local Ollama is the default answer provider in the app.
 
 5. In another terminal, install and start the frontend:
 
@@ -49,7 +52,7 @@ The existing `sds/` PDFs and `chroma_db/` database remain at the project root. T
 
 ## Run with Docker
 
-1. Copy `.env.example` to `.env` and add your Gemini API key. Add `OPENROUTER_API_KEY` only if you want the hosted open-weight model choices.
+1. Copy `.env.example` to `.env`. Pull the configured Ollama models on the host. Add `OPENROUTER_API_KEY` only if you want hosted answer-model choices.
 2. From the project root, run:
 
    ```powershell
@@ -59,7 +62,7 @@ The existing `sds/` PDFs and `chroma_db/` database remain at the project root. T
 3. Open `http://localhost:8080`. Both the web app and API are bound to localhost by default.
 
 Compose mounts `sds/` and `chroma_db/` from the project into the backend container, so uploaded PDFs and the local index persist on your computer. Keep `.env` private; it is excluded from Git.
-The backend container connects to an Ollama service on the host through `host.docker.internal`; set `OLLAMA_BASE_URL` in `.env` if needed.
+The backend container connects to an Ollama service on the host through `host.docker.internal`; set `OLLAMA_BASE_URL` in `.env` if needed. Pull both configured Ollama models on the host before indexing or asking questions.
 OpenRouter is called directly by the backend container; hosted model keys remain server-side and are never sent to the browser.
 
 The source library supports reindexing and removing documents. For PDFs uploaded through the app, citations can open the original PDF at the cited page. The welcome screen includes a comparison action that requires at least two selected SDS documents.
@@ -76,13 +79,13 @@ The frontend library lists documents represented in Chroma; PDFs in `sds/` are n
 
 ## Rebuild the passage index
 
-The current RAG pipeline uses the `sds_passages_v2` collection with smaller overlapping passages and page metadata. The previous `sds_sections` collection is left untouched. After upgrading from the original version, rebuild the passage index once:
+The current pipeline uses model-specific collections with overlapping passages and page metadata. Embeddings from different providers or models are kept separate. After switching embedding providers or models, reindex the PDFs into the selected collection. Existing Gemini-indexed documents remain in their original collection until reindexed with the local model:
 
 ```powershell
 python backend\embed_and_store.py sds\
 ```
 
-The same command can be run in Docker after starting Compose:
+The same command can be run in Docker after starting Compose and ensuring Ollama is available:
 
 ```powershell
 docker compose exec backend python backend/embed_and_store.py /app/sds

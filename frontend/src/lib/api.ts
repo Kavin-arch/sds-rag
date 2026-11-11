@@ -21,7 +21,7 @@ export interface Source {
 export interface ChatResponse {
   answer: string
   sources: Source[]
-  retrieval?: { mode: string; provider?: string; candidates: number; reranking: string }
+  retrieval?: { mode: string; provider?: string; candidates: number; query_transform_ms?: number; retrieval_ms?: number; generation_ms?: number; latency_ms?: number; reranking: string }
 }
 
 export type ChatProvider = 'gemini' | 'qwen' | 'qwen3_235b' | 'deepseek_r1'
